@@ -1,0 +1,184 @@
+# =============================================================================
+# AEGIS — zokastech.fr — https://zokastech.fr
+# Scans de sécurité : Rust (cargo-audit, cargo-deny), Go (govulncheck), Trivy
+# =============================================================================
+# Rust : RustSec + politique licences / graphe (Embark cargo-deny).
+#   Docs Context7 / Embark : https://embarkstudios.github.io/cargo-deny/
+# Dependabot (.github/dependabot.yml) complète avec des PR de mise à jour.
+# =============================================================================
+name: Security
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Binaire musl x86_64 (ubuntu-latest) — cargo-deny ≥ 0.19 parse la DB RustSec (CVSS 4.0).
+  CARGO_DENY_VERSION: 0.19.0
+  CARGO_DENY_SHA256: 0e8c2aa59128612c90d9e09c02204e912f29a5b8d9a64671b94608cbe09e064f
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # cargo-audit : RustSec advisory-db (vulnérabilités). Échoue si CVE non corrigée.
+  # ---------------------------------------------------------------------------
+  rust-audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          shared-key: security-audit
+
+      - name: Install cargo-audit (locked)
+        run: cargo install cargo-audit --locked
+
+      # Aligner le lock avec Cargo.toml (pyo3 workspace ≥0.24.2, RUSTSEC-2025-0020) avant le scan.
+      - name: cargo update (pyo3)
+        run: cargo update -p pyo3 -p pyo3-build-config -p pyo3-ffi -p pyo3-macros -p pyo3-macros-backend
+
+      - name: cargo audit
+        run: cargo audit
+
+  # ---------------------------------------------------------------------------
+  # cargo-deny : advisories + licences (+ bans/sources en avertissement via deny.toml).
+  # Binaire épinglé (SHA256) plutôt que cargo-deny-action 2.0.13 (cargo-deny 0.18.x)
+  # pour éviter l’erreur de parse CVSS 4.0 sur advisory-db.
+  # ---------------------------------------------------------------------------
+  rust-deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          shared-key: security-deny
+
+      - name: Install cargo-deny (pinned binary + checksum)
+        run: |
+          set -euxo pipefail
+          TD="/tmp/cargo-deny-${CARGO_DENY_VERSION}"
+          mkdir -p "$TD"
+          ARCHIVE="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -sSfL -o "$TD/$ARCHIVE" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${ARCHIVE}"
+          echo "${CARGO_DENY_SHA256}  $TD/$ARCHIVE" | sha256sum -c -
+          tar -xzf "$TD/$ARCHIVE" -C "$TD" --strip-components=1
+          sudo install -m 0755 "$TD/cargo-deny" /usr/local/bin/
+          cargo deny --version
+
+      - name: cargo update (pyo3)
+        run: cargo update -p pyo3 -p pyo3-build-config -p pyo3-ffi -p pyo3-macros -p pyo3-macros-backend
+
+      - name: cargo deny check
+        run: cargo deny check
+
+  # ---------------------------------------------------------------------------
+  # govulncheck (Go)
+  # ---------------------------------------------------------------------------
+  go-vulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version: "1.25.8"
+          cache: true
+          cache-dependency-path: |
+            aegis-gateway/go.sum
+            aegis-policy/go.sum
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Pin patched gateway deps (GO-2026-4762, GO-2025-3553)
+        working-directory: aegis-gateway
+        run: |
+          go get google.golang.org/grpc@v1.79.3 \
+            github.com/golang-jwt/jwt/v5@v5.2.2 \
+            github.com/labstack/echo/v4@v4.13.4
+          go mod tidy
+
+      - name: Resolved gateway modules (grpc / jwt / echo)
+        working-directory: aegis-gateway
+        run: go list -m google.golang.org/grpc github.com/golang-jwt/jwt/v5 github.com/labstack/echo/v4
+
+      - name: govulncheck (aegis-policy)
+        working-directory: aegis-policy
+        run: govulncheck ./...
+
+      - name: govulncheck (aegis-gateway)
+        working-directory: aegis-gateway
+        run: govulncheck ./...
+
+  # ---------------------------------------------------------------------------
+  # Trivy (image gateway)
+  # ---------------------------------------------------------------------------
+  trivy-image:
+    name: Trivy (Dockerfile.gateway)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Build image (load into Docker)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: docker/Dockerfile.gateway
+          load: true
+          tags: aegis-gateway:security-scan
+          push: false
+
+      - name: Run Trivy scanner
+        env:
+          TRIVY_VERSION: 0.58.1
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:${TRIVY_VERSION} image \
+            --severity CRITICAL,HIGH,MEDIUM \
+            --exit-code 0 \
+            aegis-gateway:security-scan
+
+      - name: Trivy (SARIF pour GitHub Security tab — optionnel)
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          TRIVY_VERSION: 0.58.1
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD:/work" -w /work \
+            aquasec/trivy:${TRIVY_VERSION} image \
+            --format sarif \
+            --output trivy-results.sarif \
+            aegis-gateway:security-scan || true
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        if: always()
+        with:
+          name: trivy-sarif
+          path: trivy-results.sarif
+          if-no-files-found: ignore

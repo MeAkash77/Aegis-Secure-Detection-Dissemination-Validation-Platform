@@ -1,0 +1,292 @@
+# AEGIS — zokastech.fr — Apache 2.0 / MIT
+"""
+Export ONNX (optimisations + quantification INT8) et benchmark latence PyTorch / ONNX.
+Sauvegarde tokenizer au format Hugging Face (tokenizer.json utilisable depuis la crate Rust `tokenizers`).
+"""
+
+from __future__ import annotations
+
+import os
+
+# Avant `import onnxruntime` : moins de bruit PCI / discovery sur runners cloud (ex. GitHub Actions).
+if os.environ.get("AEGIS_EXPORT_ONNX_QUIET_ORT", "1").lower() not in ("0", "false", "no"):
+    os.environ.setdefault("ORT_LOG_SEVERITY_LEVEL", "3")
+
+import argparse
+import inspect
+import json
+import logging
+import statistics
+import time
+import warnings
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
+import onnx
+import torch
+from onnxruntime import GraphOptimizationLevel, InferenceSession, SessionOptions
+from onnxruntime.quantization import QuantType, quantize_dynamic
+from transformers import AutoModelForTokenClassification
+
+from dataset_builder import LABELS
+from hf_tokenizer_utils import load_autotokenizer_pretrained
+
+MANIFEST_FILENAME = "zoka_sentinel_manifest.json"
+DEFAULT_PRODUCT_NAME = "ZOKA-SENTINEL"
+
+
+class _SkipQuantPreprocessHint(logging.Filter):
+    """Évite le WARNING:root ORT sur le pré-traitement (non requis pour notre flux INT8)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "pre-processing before quantization" not in record.getMessage()
+
+
+def _set_onnx_metadata(model: onnx.ModelProto, key: str, value: str) -> None:
+    for p in model.metadata_props:
+        if p.key == key:
+            p.value = value
+            return
+    entry = model.metadata_props.add()
+    entry.key = key
+    entry.value = value
+
+
+def write_product_manifest_and_tag_onnx(
+    out_dir: str,
+    onnx_paths: List[str],
+    *,
+    product_name: str,
+    product_version: str,
+) -> None:
+    """Nom commercial ZOKA-SENTINEL + version : fichier manifeste + champs ONNX metadata_props."""
+    manifest = {
+        "product_name": product_name,
+        "product_version": product_version,
+        "exported_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    manifest_path = os.path.join(out_dir, MANIFEST_FILENAME)
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+    for path in onnx_paths:
+        if not os.path.isfile(path):
+            continue
+        m = onnx.load(path)
+        _set_onnx_metadata(m, "product_name", product_name)
+        _set_onnx_metadata(m, "product_version", product_version)
+        _set_onnx_metadata(m, "producer", "ZokaStech AEGIS")
+        onnx.save(m, path)
+
+
+def export_torch_to_onnx(
+    model: torch.nn.Module,
+    tokenizer: Any,
+    onnx_path: str,
+    opset: int = 14,
+) -> None:
+    model.eval()
+    device = next(model.parameters()).device
+    dummy = tokenizer(
+        ["EU PII test sentence for export."],
+        return_tensors="pt",
+        padding="max_length",
+        truncation=True,
+        max_length=128,
+    )
+    input_ids = dummy["input_ids"].to(device)
+    attention_mask = dummy["attention_mask"].to(device)
+
+    class _Wrap(torch.nn.Module):
+        def __init__(self, m):
+            super().__init__()
+            self.m = m
+
+        def forward(self, input_ids, attention_mask):
+            return self.m(input_ids=input_ids, attention_mask=attention_mask).logits
+
+    wrapped = _Wrap(model).eval()
+
+    # PyTorch 2.5+ : l’exporteur Dynamo + onnxscript peut appeler le version_converter ONNX
+    # et échouer sur LayerNormalization vers opset 14 (« No Previous Version of LayerNormalization »).
+    # L’export TorchScript classique (`dynamo=False`) produit un graphe compatible opset 14.
+    export_kw: Dict[str, Any] = {
+        "input_names": ["input_ids", "attention_mask"],
+        "output_names": ["logits"],
+        "dynamic_axes": {
+            "input_ids": {0: "batch", 1: "sequence"},
+            "attention_mask": {0: "batch", 1: "sequence"},
+            "logits": {0: "batch", 1: "sequence"},
+        },
+        "opset_version": opset,
+        "do_constant_folding": True,
+    }
+    if "dynamo" in inspect.signature(torch.onnx.export).parameters:
+        export_kw["dynamo"] = False
+
+    # Export TorchScript volontaire (évite LayerNormalization / version_converter ONNX sur opset 14).
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=".*legacy TorchScript-based ONNX export.*",
+            category=DeprecationWarning,
+        )
+        _tracer_w = getattr(torch.jit, "TracerWarning", None)
+        if _tracer_w is not None:
+            warnings.filterwarnings("ignore", category=_tracer_w)
+        torch.onnx.export(
+            wrapped,
+            (input_ids, attention_mask),
+            onnx_path,
+            **export_kw,
+        )
+
+
+def optimize_onnx_graph(src: str, dst: str) -> None:
+    # EXTENDED : graphe portable entre machines (ORT_ENABLE_ALL + NCHWC peut déclencher
+    # des optimisations dépendantes du matériel et des avertissements à la sérialisation).
+    opts = SessionOptions()
+    opts.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+    opts.optimized_model_filepath = dst
+    InferenceSession(src, opts, providers=["CPUExecutionProvider"])
+
+
+def benchmark(
+    run_fn,
+    warmup: int = 5,
+    runs: int = 30,
+) -> Tuple[float, float]:
+    for _ in range(warmup):
+        run_fn()
+    times: List[float] = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        run_fn()
+        times.append(time.perf_counter() - t0)
+    return statistics.mean(times), statistics.stdev(times) if len(times) > 1 else 0.0
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Export NER model to ONNX + INT8 + latency bench.")
+    parser.add_argument("--model_dir", type=str, default="./outputs/ner-xlmr-eu-pii/best_hf")
+    parser.add_argument("--out_dir", type=str, default="./exports/onnx_ner")
+    parser.add_argument("--seq_len", type=int, default=128)
+    parser.add_argument("--bench_runs", type=int, default=30)
+    parser.add_argument(
+        "--skip_benchmark",
+        action="store_true",
+        help="N’exécute pas le bench latence PyTorch/ONNX (CI plus rapide).",
+    )
+    parser.add_argument(
+        "--product_name",
+        type=str,
+        default=os.environ.get("AEGIS_MODEL_PRODUCT_NAME", DEFAULT_PRODUCT_NAME),
+        help="Nom commercial du modèle (défaut: ZOKA-SENTINEL ou AEGIS_MODEL_PRODUCT_NAME).",
+    )
+    parser.add_argument(
+        "--product_version",
+        type=str,
+        default=os.environ.get("AEGIS_MODEL_PRODUCT_VERSION", "1.0.0"),
+        help="Version semver ou build id (défaut: 1.0.0 ou AEGIS_MODEL_PRODUCT_VERSION).",
+    )
+    args = parser.parse_args()
+
+    model_dir = os.path.abspath(os.path.expanduser(args.model_dir))
+    if not os.path.isdir(model_dir):
+        raise SystemExit(
+            f"model_dir introuvable : {model_dir}\n"
+            "Indiquez le dossier du checkpoint Hugging Face (ex. …/outputs/ner-…/best_hf) "
+            "après train_ner.py."
+        )
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    tok_path = os.path.join(args.out_dir, "tokenizer_hf")
+    onnx_fp32 = os.path.join(args.out_dir, "model.onnx")
+    onnx_opt = os.path.join(args.out_dir, "model_optimized.onnx")
+    onnx_int8 = os.path.join(args.out_dir, "model_int8.onnx")
+
+    # local_files_only: prevents HF Hub from treating an absolute path as repo_id (recent transformers/hub).
+    tokenizer = load_autotokenizer_pretrained(model_dir, local_files_only=True)
+    model = AutoModelForTokenClassification.from_pretrained(model_dir, local_files_only=True)
+    model.eval()
+    model.cpu()
+
+    tokenizer.save_pretrained(tok_path)
+
+    export_torch_to_onnx(model, tokenizer, onnx_fp32)
+    onnx_model = onnx.load(onnx_fp32)
+    onnx.checker.check_model(onnx_model)
+
+    optimize_onnx_graph(onnx_fp32, onnx_opt)
+    # Quantifier depuis le graphe ONNX d’origine (l’optimiseur ORT peut casser shape_inference).
+    _qfilter = _SkipQuantPreprocessHint()
+    logging.root.addFilter(_qfilter)
+    try:
+        quantize_dynamic(onnx_fp32, onnx_int8, weight_type=QuantType.QUInt8)
+    finally:
+        logging.root.removeFilter(_qfilter)
+
+    write_product_manifest_and_tag_onnx(
+        args.out_dir,
+        [onnx_fp32, onnx_opt, onnx_int8],
+        product_name=args.product_name,
+        product_version=args.product_version,
+    )
+
+    if not args.skip_benchmark:
+        text = "Contact: Marie Dupont email m.dupont@acme.eu IBAN FR76 3000 6000 0112 3456 7890 189"
+        enc = tokenizer(
+            [text],
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=args.seq_len,
+        )
+        input_ids = enc["input_ids"].numpy().astype(np.int64)
+        attention_mask = enc["attention_mask"].numpy().astype(np.int64)
+
+        def pt_run():
+            with torch.no_grad():
+                _ = model(
+                    input_ids=torch.from_numpy(input_ids),
+                    attention_mask=torch.from_numpy(attention_mask),
+                ).logits.numpy()
+
+        sess_fp32 = InferenceSession(onnx_fp32, providers=["CPUExecutionProvider"])
+        sess_opt = InferenceSession(onnx_opt, providers=["CPUExecutionProvider"])
+        sess_q = InferenceSession(onnx_int8, providers=["CPUExecutionProvider"])
+
+        def ort_run(sess: InferenceSession):
+            _ = sess.run(
+                None,
+                {"input_ids": input_ids, "attention_mask": attention_mask},
+            )
+
+        results: Dict[str, Tuple[float, float]] = {}
+        results["pytorch_fp32"] = benchmark(pt_run, runs=args.bench_runs)
+        results["onnx_fp32"] = benchmark(lambda: ort_run(sess_fp32), runs=args.bench_runs)
+        results["onnx_optimized"] = benchmark(lambda: ort_run(sess_opt), runs=args.bench_runs)
+        results["onnx_int8"] = benchmark(lambda: ort_run(sess_q), runs=args.bench_runs)
+
+        report = os.path.join(args.out_dir, "latency_benchmark.txt")
+        lines = [
+            f"seq_len={args.seq_len} runs={args.bench_runs}",
+            f"num_labels={len(LABELS)}",
+            "",
+        ]
+        for k, (m, s) in results.items():
+            lines.append(f"{k}: mean_s={m:.6f} stdev_s={s:.6f}")
+        with open(report, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+        print("\n".join(lines))
+
+    print(f"\nTokenizer (Rust `tokenizers`): {tok_path}/tokenizer.json")
+    print(f"ONNX INT8: {onnx_int8}")
+    print(f"Métadonnées produit: {args.product_name} v{args.product_version} → {MANIFEST_FILENAME}")
+
+
+if __name__ == "__main__":
+    main()
