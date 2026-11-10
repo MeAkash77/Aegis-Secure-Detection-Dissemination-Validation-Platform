@@ -42,7 +42,7 @@ rand = "0.8"
 metrics = "0.24"
 ctor = "0.2"
 proptest = "1.5"
-criterion = "0.5"
+criterion = "0.8"
 libc = "0.2"
 # RUSTSEC-2025-0020 : pyo3 ≥ 0.24.1 (voir sdk-python/Cargo.toml)
 pyo3 = { version = "0.24.2", features = ["auto-initialize"] }
