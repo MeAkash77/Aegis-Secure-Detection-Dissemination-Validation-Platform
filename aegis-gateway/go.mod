@@ -1,8 +1,6 @@
 module github.com/zokastech/aegis/aegis-gateway
 
-go 1.25
-
-toolchain go1.25.8
+go 1.26.0
 
 require (
 	github.com/coreos/go-oidc/v3 v3.11.0
@@ -15,7 +13,7 @@ require (
 	github.com/sony/gobreaker v1.0.0
 	github.com/spf13/pflag v1.0.5
 	github.com/spf13/viper v1.19.0
-	golang.org/x/time v0.11.0
+	golang.org/x/time v0.16.0
 	google.golang.org/grpc v1.79.3
 	google.golang.org/protobuf v1.36.10
 	gopkg.in/yaml.v3 v3.0.1
